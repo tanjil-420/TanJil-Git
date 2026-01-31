@@ -1,5 +1,7 @@
 const fs = require("fs-extra");
 const nullAndUndefined = [undefined, null];
+const leven = require('leven'); // <--- Levenshtein Distance লাইব্রেরি
+
 // const { config } = global.GoatBot;
 // const { utils } = global;
 
@@ -7,13 +9,39 @@ function getType(obj) {
 	return Object.prototype.toString.call(obj).slice(8, -1);
 }
 
+// <<< --- NEW: getRole FUNCTION WITH CUSTOM HIERARCHY --- >>>
 function getRole(threadData, senderID) {
-	const adminBot = global.GoatBot.config.adminBot || [];
+	const config = global.GoatBot.config;
+	const adminBot = config.adminBot || [];
+	const developer = config.developer || [];
+    // NEW: Get vipuser list (Assuming vipuser is in config.json for role assignment)
+	const vipuser = config.vipuser || []; 
+    
 	if (!senderID)
 		return 0;
 	const adminBox = threadData ? threadData.adminIDs || [] : [];
-	return adminBot.includes(senderID) ? 2 : adminBox.includes(senderID) ? 1 : 0;
+    
+	// 4. Developer (Highest Rank - needed for Role 4 commands)
+    if (developer.includes(senderID))
+        return 4;
+    
+    // 3. AdminBot (Needed for Role 3 commands)
+    if (adminBot.includes(senderID))
+        return 3; 
+    
+    // 2. VIP User (Needed for Role 2 commands)
+	if (vipuser.includes(senderID))
+        return 2; 
+
+    // 1. Group Admin (Needed for Role 1 commands)
+    if (adminBox.includes(senderID))
+        return 1;
+    
+    // 0. All Other Users (Lowest Rank)
+    return 0;
 }
+// <<< --- END: getRole FUNCTION --- >>>
+
 
 function getText(type, reason, time, targetID, lang) {
 	const utils = global.utils;
@@ -71,7 +99,15 @@ function getRoleConfig(utils, command, isGroup, threadData, commandName) {
 
 function isBannedOrOnlyAdmin(userData, threadData, senderID, threadID, isGroup, commandName, message, lang) {
 	const config = global.GoatBot.config;
-	const { adminBot, hideNotiMessage } = config;
+	// ✅ developerOnly, vipOnly যোগ করা হয়েছে
+	const { adminBot, developer, vipuser, hideNotiMessage, developerOnly, vipOnly } = config; 
+	
+	// Group all high roles for global checks
+	const allHighRoles = [...adminBot, ...developer, ...vipuser]; 
+    
+    // ✅ এখানে role বের করে নেওয়া হয়েছে 
+    // কারণ এটি global check এর জন্য দরকার।
+    const role = getRole(threadData, senderID); 
 
 	// check if user banned
 	const infoBannedUser = userData.banned;
@@ -82,16 +118,44 @@ function isBannedOrOnlyAdmin(userData, threadData, senderID, threadID, isGroup, 
 		return true;
 	}
 
-	// check if only admin bot
+	// 1. Check if only Admin Bot (Role 3 and above)
+	// The original code was checking for Bot Admin (Role 3 in new hierarchy)
 	if (
 		config.adminOnly.enable == true
-		&& !adminBot.includes(senderID)
+		&& !adminBot.includes(senderID) // Check if the sender is NOT AdminBot (Rank 3)
+		&& !config.developer.includes(senderID) // Check if the sender is NOT Developer (Rank 4)
+		&& !config.vipuser.includes(senderID) // Check if the sender is NOT VIP User (Rank 2)
 		&& !config.adminOnly.ignoreCommand.includes(commandName)
 	) {
 		if (hideNotiMessage.adminOnly == false)
-			message.reply(getText("onlyAdminBot", null, null, null, lang));
+			message.reply(global.utils.getText({ lang, head: "handlerEvents" }, "onlyAdminBot", null, null, null, lang));
 		return true;
 	}
+	
+    // 2. >>> NEW: Check for DeveloperOnly mode (VIP Users only, i.e., Role >= 2)
+    // /devonly on করলে, VIP User (Role 2) বা তার উপরের র্যাঙ্কের ইউজারদের অ্যাক্সেস থাকবে।
+	if (
+		(developerOnly?.enable == true)
+		&& role < 2 // Check if the user is less than VIP User
+		&& !(developerOnly?.ignoreCommand || []).includes(commandName)
+	) {
+		if ((hideNotiMessage.developerOnly ?? false) == false) 
+			message.reply(global.utils.getText({ lang, head: "handlerEvents" }, "onlyVipUserGlobal", null, null, null, lang)); 
+		return true;
+	}
+    
+	// 3. >>> NEW: Check for VIPOnly mode (VIP Users only, i.e., Role >= 2)
+	// /viponly on করলেও, VIP User (Role 2) বা তার উপরের র্যাঙ্কের ইউজারদের অ্যাক্সেস থাকবে।
+	if (
+		(vipOnly?.enable == true)
+		&& role < 2 // Check if the user is less than VIP User
+		&& !(vipOnly?.ignoreCommand || []).includes(commandName)
+	) {
+		if ((hideNotiMessage.vipOnly ?? false) == false)
+			message.reply(global.utils.getText({ lang, head: "handlerEvents" }, "onlyVipUserGlobal", null, null, null, lang));
+		return true;
+	}
+
 
 	// ==========    Check Thread    ========== //
 	if (isGroup == true) {
@@ -251,12 +315,42 @@ module.exports = function (api, threadModel, userModel, dashBoardModel, globalMo
 			if (isBannedOrOnlyAdmin(userData, threadData, senderID, threadID, isGroup, commandName, message, langCode))
 				return;
 			if (!command)
-				if (!hideNotiMessage.commandNotFound)
-					return await message.reply(
-						commandName ?
-							utils.getText({ lang: langCode, head: "handlerEvents" }, "commandNotFound", commandName, prefix) :
-							utils.getText({ lang: langCode, head: "handlerEvents" }, "commandNotFound2", prefix)
-					);
+				if (!hideNotiMessage.commandNotFound) {
+					// <------------------- NEW FUZZY MATCHING LOGIC STARTS HERE --------------------->
+					
+					const allCommands = Array.from(GoatBot.commands.keys());
+					let closestCommand = null;
+					let minDistance = 999;
+					const distanceThreshold = 2; // Allow up to 2 character differences
+
+					// Check only if a command name was actually attempted (e.g., /halp, not just /)
+					if (commandName) {
+						for (const correctCommand of allCommands) {
+							// Check distance for the prefix-less command part
+							const distance = leven(commandName.toLowerCase(), correctCommand.toLowerCase());
+
+							if (distance < minDistance && distance <= distanceThreshold) {
+								minDistance = distance;
+								closestCommand = correctCommand;
+							}
+						}
+					}
+					
+					if (closestCommand) {
+						// Found a suggestion, use the new lang key
+						return await message.reply(
+							utils.getText({ lang: langCode, head: "handlerEvents" }, "commandNotFoundSuggestion", closestCommand, prefix)
+						);
+					} else {
+						// No suggestion or commandName was empty, fall back to original logic
+						return await message.reply(
+							commandName ?
+								utils.getText({ lang: langCode, head: "handlerEvents" }, "commandNotFound", commandName, prefix) :
+								utils.getText({ lang: langCode, head: "handlerEvents" }, "commandNotFound2", prefix)
+						);
+					}
+					// <------------------- NEW FUZZY MATCHING LOGIC ENDS HERE ----------------------->
+				}
 				else
 					return true;
 			// ————————————— CHECK PERMISSION ———————————— //
@@ -265,10 +359,14 @@ module.exports = function (api, threadModel, userModel, dashBoardModel, globalMo
 
 			if (needRole > role) {
 				if (!hideNotiMessage.needRoleToUseCmd) {
-					if (needRole == 1)
+					if (needRole == 1) // Min Rank 1: Group Admin
 						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyAdmin", commandName));
-					else if (needRole == 2)
+					else if (needRole == 2) // Min Rank 2: VIP User
 						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyAdminBot2", commandName));
+					else if (needRole == 3) // Min Rank 3: AdminBot
+						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyVipUser", commandName)); // Re-purposing an existing key for Rank 3 min.
+					else if (needRole == 4) // Min Rank 4: Developer Only
+						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyDeveloper", commandName)); // Using the Developer key for Rank 4
 				}
 				else {
 					return true;
@@ -490,8 +588,7 @@ module.exports = function (api, threadModel, userModel, dashBoardModel, globalMo
 		}
 
 
-		/* 
-		 +------------------------------------------------+
+		/* +------------------------------------------------+
 		 |                    ON REPLY                    |
 		 +------------------------------------------------+
 		*/
@@ -519,10 +616,14 @@ module.exports = function (api, threadModel, userModel, dashBoardModel, globalMo
 			const needRole = roleConfig.onReply;
 			if (needRole > role) {
 				if (!hideNotiMessage.needRoleToUseCmdOnReply) {
-					if (needRole == 1)
+					if (needRole == 1) // Min Rank 1: Group Admin
 						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyAdminToUseOnReply", commandName));
-					else if (needRole == 2)
+					else if (needRole == 2) // Min Rank 2: VIP User
 						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyAdminBot2ToUseOnReply", commandName));
+					else if (needRole == 3) // Min Rank 3: AdminBot
+						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyVipUserToUseOnReply", commandName)); // Re-purposing an existing key for Rank 3 min.
+					else if (needRole == 4) // Min Rank 4: Developer Only
+						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyDeveloperToUseOnReply", commandName)); // Using the Developer key for Rank 4
 				}
 				else {
 					return true;
@@ -581,10 +682,14 @@ module.exports = function (api, threadModel, userModel, dashBoardModel, globalMo
 			const needRole = roleConfig.onReaction;
 			if (needRole > role) {
 				if (!hideNotiMessage.needRoleToUseCmdOnReaction) {
-					if (needRole == 1)
+					if (needRole == 1) // Min Rank 1: Group Admin
 						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyAdminToUseOnReaction", commandName));
-					else if (needRole == 2)
+					else if (needRole == 2) // Min Rank 2: VIP User
 						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyAdminBot2ToUseOnReaction", commandName));
+					else if (needRole == 3) // Min Rank 3: AdminBot
+						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyVipUserToUseOnReaction", commandName)); // Re-purposing an existing key for Rank 3 min.
+					else if (needRole == 4) // Min Rank 4: Developer Only
+						return await message.reply(utils.getText({ lang: langCode, head: "handlerEvents" }, "onlyDeveloperToUseOnReaction", commandName)); // Using the Developer key for Rank 4
 				}
 				else {
 					return true;

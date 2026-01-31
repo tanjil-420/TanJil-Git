@@ -1,104 +1,98 @@
 const createFuncMessage = global.utils.message;
 const handlerCheckDB = require("./handlerCheckData.js");
 
-const request = require("request")
-const axios = require("axios")
-const fs = require("fs-extra")
-
-
 module.exports = (api, threadModel, userModel, dashBoardModel, globalModel, usersData, threadsData, dashBoardData, globalData) => {
 	const handlerEvents = require(process.env.NODE_ENV == 'development' ? "./handlerEvents.dev.js" : "./handlerEvents.js")(api, threadModel, userModel, dashBoardModel, globalModel, usersData, threadsData, dashBoardData, globalData);
 
 	return async function (event) {
+		// Anti-Inbox check
+		if (
+			global.GoatBot.config.antiInbox == true &&
+			(event.senderID == event.threadID || event.userID == event.senderID || event.isGroup == false) &&
+			(event.senderID || event.userID || event.isGroup == false)
+		)
+			return;
+
 		const message = createFuncMessage(api, event);
 
+		// DB check/update
 		await handlerCheckDB(usersData, threadsData, event);
+
+		// Event handler load
 		const handlerChat = await handlerEvents(event, message);
 		if (!handlerChat)
 			return;
 
-		const { onStart, onChat, onReply, onEvent, handlerEvent, onReaction, typ, presence, read_receipt } = handlerChat;
+		// Approval system
+		if(global.GoatBot.config?.approval){
+			const approvedtid = await globalData.get("approved", "data", {});
+			if (!approvedtid.approved) {
+				approvedtid.approved = [];
+				await globalData.set("approved", approvedtid, "data");
+			}
+			if (!approvedtid.approved.includes(event.threadID)) return;
+		}
+
+		const {
+			onAnyEvent, onFirstChat, onStart, onChat,
+			onReply, onEvent, handlerEvent, onReaction,
+			typ, presence, read_receipt
+		} = handlerChat;
+
+		// run any event
+		onAnyEvent();
 
 		switch (event.type) {
 			case "message":
 			case "message_reply":
 			case "message_unsend":
+				onFirstChat();
 				onChat();
 				onStart();
 				onReply();
-        if(event.type == "message_unsend"){
-          
-          let resend = await threadsData.get(event.threadID, "settings.reSend");
-		if (resend == true && event.senderID 
-!== api.getCurrentUserID()){
-      let umid = global.reSend[event.threadID].findIndex(e => e.messageID === event.messageID)
-      
-      if(umid>(-1)){
-let nname = await usersData.getName(event.senderID)
-        let attch = []
-if(global.reSend[event.threadID][umid].attachments.length>0){
-  let cn = 0
-  for(var abc of global.reSend[event.threadID][umid].attachments){
-   if(abc.type == "audio"){
-    
-    cn += 1;
-
-   let pts = `scripts/cmds/tmp/${cn}.mp3`
-					let res2 = (await axios.get(abc.url, {
-						responseType: "arraybuffer"
-					})).data;
-			fs.writeFileSync(pts, Buffer.from(res2, "utf-8"))
-    
-  attch.push(fs.createReadStream(pts))} else{
-     attch.push(await global.utils.getStreamFromURL(abc.url))
-  }
-  }
-}
-        
-  api.sendMessage({body: nname + " removed:\n\n" + global.reSend[event.threadID][umid].body,
-mentions:[{id:event.senderID, tag:nname}],
-    attachment:attch
-                  }, event.threadID)
-                   
-
-  
-      }
-    }
-        }
 				break;
+
 			case "event":
 				handlerEvent();
 				onEvent();
 				break;
+
 			case "message_reaction":
 				onReaction();
-        if(event.reaction == "❗"){
-  if(event.userID == "61561101500902"){
-api.removeUserFromGroup(event.senderID, event.threadID, (err) => {
-                if (err) return console.log(err);
-              });
 
-}else{
-    message.send(":)")
-  }
-  }
-        if(event.reaction == "🌷"){
-  if(event.senderID == api.getCurrentUserID()){if(event.userID == "61579509758592"){
-    message.unsend(event.messageID)
-}else{
-    message.send(":)")
-  }}
-        }
+				const { delete: del, kick } = global.GoatBot.config?.reactBy || { delete: [], kick: [] };
+
+				// 🗑️ Delete message
+				if (del.includes(event.reaction)) {
+					if (event.senderID === api.getCurrentUserID()) {
+						if (global.GoatBot.config?.vipuser?.includes(event.userID)) {
+							api.unsendMessage(event.messageID);
+						}
+					}
+				}
+
+				// 👟 Kick user
+				if (kick.includes(event.reaction)) {
+					if (global.GoatBot.config?.vipuser?.includes(event.userID)) {
+						api.removeUserFromGroup(event.senderID, event.threadID, (err) => { 
+							if (err) return console.log(err); 
+						});
+					}
+				}
 				break;
+
 			case "typ":
 				typ();
 				break;
+
 			case "presence":
 				presence();
 				break;
+
 			case "read_receipt":
 				read_receipt();
 				break;
+
 			default:
 				break;
 		}
